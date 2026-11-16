@@ -8,6 +8,7 @@
 | `figures.py` | Redessine les figures depuis `resultats/` sans réentraîner |
 | `resultats/*.pt` | Points générés finaux (8 192 par condition) et réglages |
 | `figures/` | Les trois figures finales |
+| `mnist/` | Les mêmes énergies sur MNIST, dans le code du papier (voir `mnist/README.md`) |
 
 ## Relancer
 

@@ -1,0 +1,180 @@
+diff --git a/train.py b/train.py
+index 0c2054c..ab560f0 100644
+--- a/train.py
++++ b/train.py
+@@ -33,7 +33,12 @@ import torch.distributed as dist
+ from torch.nn.parallel import DistributedDataParallel as DDP
+ import torchvision
+ from torchvision.utils import save_image
+-from pytorch_fid.fid_score import calculate_fid_given_paths
++try:
++    from pytorch_fid.fid_score import calculate_fid_given_paths
++except ImportError:  # [nous] FID facultative pour les essais locaux
++    calculate_fid_given_paths = None
++
++import energies_nous as nous
+ 
+ from networks import get_model
+ from mmd import MMD2
+@@ -136,6 +141,16 @@ def train(args):
+             real_img_dir = dump_real_images_if_needed(args, base_out, device)
+     ddp_barrier()
+ 
++    # [nous] Statistiques Inception des vraies images calculées une seule fois
++    # (sinon pytorch-fid les recalcule à chaque évaluation). Même FID.
++    stats_reelles = real_img_dir
++    if args.fid and is_main and real_img_dir is not None:
++        from pytorch_fid.fid_score import save_fid_stats
++        stats_reelles = real_img_dir.rstrip("/\\") + "_stats.npz"
++        if not os.path.exists(stats_reelles):
++            save_fid_stats([real_img_dir, stats_reelles], batch_size=args.fid_batch_size,
++                           device=device, dims=2048, num_workers=0)
++
+     # ----- Data and noise samplers -----
+     data_sampler = get_sampler(args)
+     noise_sampler = get_noise(args)
+@@ -149,6 +164,8 @@ def train(args):
+ 
+     # ----- Models -----
+     netT, netD = get_model(args)
++    if args.divergence == "Sinkhorn_appris":  # [nous] deux critiques séparés g et s
++        netD = nous.DeuxPotentiels(netD, get_model(args)[1])
+     netT, netD = netT.to(device), netD.to(device)
+ 
+     kernel = get_kernel(args)
+@@ -256,7 +273,8 @@ def train(args):
+                 for p in kernel.parameters():
+                     p.requires_grad = True
+ 
+-            for _ in range(args.D_steps):
++            d_loss = torch.zeros((), device=device)  # [nous] reste 0 sans critique
++            for _ in range(0 if args.divergence in nous.SANS_CRITIQUE else args.D_steps):
+                 real_images = data_sampler.sample().to(device)
+                 if args.gp_type == "sjko" or args.divergence == "sMMD":
+                     real_images.requires_grad_()
+@@ -276,7 +294,10 @@ def train(args):
+                 d_real = netD(real_images).view(args.batch_size, -1)
+                 d_fake = netD(fake_images).view(args.batch_size, -1)
+ 
+-                d_loss = compute_D_loss(args, z, real_images, d_real, d_fake, kernel)
++                if args.divergence in nous.AVEC_CRITIQUE:  # [nous] montée des potentiels
++                    d_loss = -nous.energie(args, fake_images, real_images, d_real, d_fake)
++                else:
++                    d_loss = compute_D_loss(args, z, real_images, d_real, d_fake, kernel)
+                 if args.lbda_gp > 0:
+                     gp = gradient_penalty(
+                         args, d_real, d_fake, real_images, fake_images, netD).mean()
+@@ -303,11 +324,12 @@ def train(args):
+                     p.requires_grad = True
+ 
+             for _ in range(args.T_steps):
+-                if args.divergence in ("MMD", "iMMD", "sMMD", "chi2_tight"):
++                if args.divergence in ("MMD", "iMMD", "sMMD", "chi2_tight") + nous.NOS_DIVERGENCES:
+                     real_images = data_sampler.sample().to(device)
+                     if args.divergence == "sMMD":
+                         real_images = real_images.detach().requires_grad_(True)
+-                    d_real = netD(real_images).view(args.batch_size, -1)
++                    if args.divergence not in nous.SANS_CRITIQUE:
++                        d_real = netD(real_images).view(args.batch_size, -1)
+ 
+                 z = noise_sampler.sample().to(device)
+                 if two_input:
+@@ -323,9 +345,14 @@ def train(args):
+                         else:
+                             fake_images_old = netT_old(z.detach()).detach()
+ 
+-                d_fake = netD(fake_images).view(args.batch_size, -1)
+-
+-                g_loss = compute_G_loss(args, z, real_images, d_real, d_fake, kernel)
++                if args.divergence in nous.SANS_CRITIQUE:  # [nous] pas de critique
++                    g_loss = nous.energie(args, fake_images, real_images, None, None)
++                else:
++                    d_fake = netD(fake_images).view(args.batch_size, -1)
++                    if args.divergence in nous.AVEC_CRITIQUE:
++                        g_loss = nous.energie(args, fake_images, real_images, d_real, d_fake)
++                    else:
++                        g_loss = compute_G_loss(args, z, real_images, d_real, d_fake, kernel)
+ 
+                 if args.JKO:
+                     cost = transport_cost(
+@@ -351,12 +378,26 @@ def train(args):
+                 with open(log_path, 'a') as f:
+                     f.write(f'JKO step {k} | iter {step_generator:07d} | '
+                             f'G {g_loss.item():.4f} | D {d_loss.item():.4f} | '
+-                            f'elapsed {datetime.now() - start_time}\n')
++                            f'elapsed {datetime.now() - start_time}'
++                            + (f' | residu Sinkhorn max {nous.SUIVI["residu_max"]:.2g}'
++                               f' | non convergés {nous.SUIVI["non_converge"]}'
++                               if args.divergence == "Sinkhorn_direct" else '') + '\n')
++                nous.SUIVI.update(residu_max=0.0, non_converge=0)
++
++        # [nous] Budget horaire : on s'arrête avant de le dépasser, avec une dernière
++        # évaluation (FID + images) pour que chaque run finisse proprement.
++        ecoule = (datetime.now() - start_time).total_seconds() / 3600
++        duree_pas = ecoule / (k + 1 - start_k)
++        derniere = (k == args.JKO_steps - 1
++                    or (args.budget_heures > 0 and ecoule + 1.5 * duree_pas > args.budget_heures))
++        if derniere and is_main:
++            with open(log_path, 'a') as f:
++                f.write(f'[ARRET] dernier pas JKO {k} ({ecoule:.2f} h écoulées)\n')
+ 
+         # =========================
+         # Save samples
+         # =========================
+-        if k % args.save_image_every == 0:
++        if k % args.save_image_every == 0 or derniere:
+             ddp_barrier()
+             if is_main:
+                 netT.eval()
+@@ -384,7 +425,7 @@ def train(args):
+         # =========================
+         # Evaluation (FID + MMD)
+         # =========================
+-        if k % args.evaluate_every == 0:
++        if k % args.evaluate_every == 0 or derniere:
+             ddp_barrier()
+             if is_main:
+                 netT.eval()
+@@ -413,7 +454,7 @@ def train(args):
+ 
+                 if args.fid:
+                     fid_value = calculate_fid_given_paths(
+-                        [real_img_dir, fake_dir],
++                        [stats_reelles, fake_dir],
+                         batch_size=args.fid_batch_size, device=device, dims=2048,
+                         num_workers=0)
+                     with open(log_path, "a") as f:
+@@ -471,6 +512,8 @@ def train(args):
+                           netT_old, optimizerT, optimizerD, schedulerT, schedulerD,
+                           ema, metrics, k_next=k + 1, step_generator=step_generator)
+             ddp_barrier()
++        if derniere:
++            break
+ 
+     # ----- Final samples -----
+     ddp_barrier()
+@@ -543,7 +586,7 @@ if __name__ == '__main__':
+     parser.add_argument("--divergence", default="MMD",
+                         choices=["MMD", "ckMMD", "sMMD", "iMMD", "Wasserstein-1",
+                                  "KL", "KL_centered", "Shannon", "chi2",
+-                                 "KL_DV", "chi2_tight"],
++                                 "KL_DV", "chi2_tight"] + list(nous.NOS_DIVERGENCES),
+                         help="Divergence to minimise")
+     parser.add_argument("--symmetric", action=argparse.BooleanOptionalAction,
+                         default=False,
+@@ -613,6 +656,15 @@ if __name__ == '__main__':
+ 
+     # --- MMD parameters ---
+     parser.add_argument("--mmd_unbiased", action=argparse.BooleanOptionalAction, default=True)
++
++    # --- [nous] énergies de transport entropique ---
++    parser.add_argument("--eps_sinkhorn", type=float, default=0.05,
++                        help="epsilon pour OT_eps, Sinkhorn_appris, Sinkhorn_direct "
++                             "(coût ||x-y||²/2 sur images aplaties / sqrt(d))")
++    parser.add_argument("--tol_sinkhorn", type=float, default=1e-3)
++    parser.add_argument("--iter_sinkhorn", type=int, default=2000)
++    parser.add_argument("--budget_heures", type=float, default=0.0,
++                        help="Arrêt propre avant ce nombre d'heures (0 = pas de limite)")
+     parser.add_argument("--use_sn", action=argparse.BooleanOptionalAction, default=False,
+                         help="Spectral normalisation in discriminator")
+     parser.add_argument("--kernel", default="learned_kernel",
