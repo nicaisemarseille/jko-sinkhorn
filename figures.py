@@ -2,7 +2,8 @@
 
     python figures.py
 
-Écrit figures/banc_simple.png et figures/sinkhorn_<cible>.png,
+Écrit figures/banc_simple.png, figures/sinkhorn_<cible>.png (2D) et figures/mnist.png
+(à partir de resultats/mnist.json et mnist_echantillons.npz, produits par mnist_kaggle.py resumer),
 et affiche un tableau de mesures dans le terminal.
 """
 import sys
@@ -11,7 +12,9 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
+import json
 
 from commun import cible, mesures_huit_gaussiennes, rng
 
@@ -96,6 +99,65 @@ def sinkhorn():
         plt.close(fig)
 
 
+# MNIST : deux blocs de lignes (énergie) x colonnes (avec JKO, sans JKO, FID au fil des pas).
+MNIST = {"Méthodes du papier (critique réseau, sauf MMD fixe)": {
+             "kl_dv": "KL (Donsker-Varadhan)", "chi2": "χ²", "mmd_gan": "MMD-GAN (noyau appris)",
+             "w1": "W1 (WGAN-GP)", "mmd_fixe": "MMD fixe (alg. 1)"},
+         "Nos énergies de transport (coût ½‖x−y‖² sur les pixels)": {
+             "ot_eps0.01": "OT ε=0,01", "ot_eps0.05": "OT ε=0,05",
+             "sinkhorn_appris_eps0.01": "Sinkhorn appris ε=0,01", "sinkhorn_appris_eps0.05": "Sinkhorn appris ε=0,05",
+             "sinkhorn_direct_eps0.01": "Sinkhorn direct ε=0,01", "sinkhorn_direct_eps0.05": "Sinkhorn direct ε=0,05"}}
+
+
+def mnist():
+    resume = json.loads((RESULTATS / "mnist.json").read_text(encoding="utf-8"))
+    images = np.load(RESULTATS / "mnist_echantillons.npz")
+    lignes = max(len(b) for b in MNIST.values())
+    fig = plt.figure(figsize=(19, 2.75 * lignes + 1), constrained_layout=True)
+    print("MNIST (FID finale avec JKO | sans JKO, durée sur un T4)")
+    for sous_fig, (titre_bloc, bloc) in zip(fig.subfigures(1, 2, wspace=.04), MNIST.items()):
+        axes = sous_fig.subplots(lignes, 3, gridspec_kw=dict(width_ratios=[1, 1, 1.25]))
+        sous_fig.suptitle(titre_bloc, fontsize=14)
+        for i, (nom, titre) in enumerate(bloc.items()):
+            texte = f"  {titre:<26}"
+            for j, (jko, entete) in enumerate((("jko", "avec JKO"), ("sans_jko", "sans JKO"))):
+                ax, r = axes[i, j], resume.get(f"{nom}/{jko}")
+                ax.set(xticks=[], yticks=[])
+                if r is None:
+                    ax.text(.5, .5, "pas lancé", transform=ax.transAxes, ha="center", color="gray")
+                    texte += "            -"
+                else:
+                    ax.imshow(images[f"{nom}/{jko}"], cmap="gray", vmin=0, vmax=255)
+                    ax.set_title(f"FID {r['fid'][-1]:.1f}", fontsize=11, loc="right")
+                    axes[i, 2].plot(r["fid_pas_jko"], r["fid"], "o-", ms=3, label=entete,
+                                    color="#2563eb" if jko == "jko" else "#ea580c")
+                    texte += f" {r['fid'][-1]:6.1f} ({r['heures']:.1f} h)"
+                if i == 0:
+                    ax.set_title(entete, fontsize=12, loc="left")
+            axes[i, 0].set_ylabel(titre, fontsize=11)
+            c = axes[i, 2]
+            c.set(yscale="log", ylim=(1, 400), xlim=(0, 41))
+            c.grid(alpha=.3)
+            c.tick_params(labelsize=8)
+            if i == 0:
+                c.set_title("FID au fil des pas JKO", fontsize=12)
+                c.legend(handles=[plt.Line2D([], [], color="#2563eb", marker="o", ms=3, label="avec JKO"),
+                                  plt.Line2D([], [], color="#ea580c", marker="o", ms=3, label="sans JKO")],
+                         fontsize=8, loc="upper right")
+            if i == len(bloc) - 1:
+                c.set_xlabel("pas (500 itérations chacun)", fontsize=9)
+            print(texte)
+        for i in range(len(bloc), lignes):
+            for ax in axes[i]:
+                ax.axis("off")
+    fig.suptitle("MNIST : 64 échantillons finaux par run (même bruit z partout), 40 pas × 500 itérations, "
+                 "une graine ; FID sur 50 000 échantillons", fontsize=15)
+    FIGURES.mkdir(exist_ok=True)
+    fig.savefig(FIGURES / "mnist.png", dpi=110)
+    plt.close(fig)
+
+
 if __name__ == "__main__":
     banc_simple()
     sinkhorn()
+    mnist()

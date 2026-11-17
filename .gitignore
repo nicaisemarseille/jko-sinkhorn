@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+# MNIST : leur dépôt patché et les sorties Kaggle brutes (voir README)
+gwf/
+resultats_kaggle/
+kaggle_jobs/
