@@ -8,11 +8,12 @@ Résultat : resultats/sinkhorn.pt, puis figures/sinkhorn_<cible>.png.
 Une condition déjà présente dans resultats/sinkhorn.pt n'est pas recalculée.
 
 Énergies (coût c = ||x-y||²/2, epsilon = 0,05) :
-  ot        OT_eps(mu, nu), semi-dual, un potentiel neuronal g.
-  sinkhorn  S_eps(mu, nu) = OT_eps(mu,nu) - OT_eps(mu,mu)/2 - OT_eps(nu,nu)/2,
+  ot        « OT ε » : OT_eps(mu, nu), semi-dual, un potentiel neuronal g.
+  sinkhorn  « Sinkhorn, forme variationnelle » :
+            S_eps(mu, nu) = OT_eps(mu,nu) - OT_eps(mu,mu)/2 - OT_eps(nu,nu)/2,
             formule à deux potentiels neuronaux g et s (preuve C du rapport).
-  direct    S_eps calculé exactement sur chaque lot par l'algorithme de Sinkhorn,
-            sans aucun réseau critique (gradient d'enveloppe).
+  direct    « Sinkhorn » : S_eps calculé exactement sur chaque lot par l'algorithme de Sinkhorn,
+            sans aucun réseau critique (gradient d'enveloppe), comme sur MNIST.
 La constante -OT_eps(nu,nu)/2 est omise : elle ne dépend pas du générateur.
 Pas de pénalité R1 ici, 20 pas JKO de 500 itérations.
 """
